@@ -1,0 +1,58 @@
+# Tarea diaria de Samarkanda 2.0: suspensión por mora (una vez al mes, desde el día 5) y
+# recordatorios de pago (días 1 y 3). Sustituye al Cron Trigger de Cloudflare (cuenta en el
+# límite gratis). Llama a POST /cron/diario del Worker con el secret CRON_SECRET.
+# Solo acciones/comandos propios: curl y gh (ya vienen en el runner). Sin acciones de terceros.
+name: Tarea diaria (mora y recordatorios)
+
+on:
+  schedule:
+    - cron: '0 16 * * *'   # 16:00 UTC = 9:00 Hermosillo (UTC-7 todo el año), igual que La Marquesa
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: 'simular = solo cuenta, no cambia nada · aplicar = corre la tarea real'
+        type: choice
+        options: [simular, aplicar]
+        default: simular
+
+permissions:
+  actions: write     # solo para re-habilitar este mismo workflow (anti-desactivación de 60 días)
+  contents: read
+
+concurrency:         # nunca dos corridas a la vez (el Worker además tiene su propio candado)
+  group: cron-diario
+  cancel-in-progress: false
+
+jobs:
+  diario:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Llamar al Worker
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          MODO: ${{ github.event_name == 'schedule' && 'aplicar' || inputs.modo }}
+          URL: https://samarkanda2-proxy.acosta4770.workers.dev/cron/diario
+        run: |
+          set -u
+          if [ -z "$CRON_SECRET" ]; then echo "::error::Falta el secret CRON_SECRET"; exit 1; fi
+          echo "Modo: $MODO"
+          # Reintenta solo si no hubo respuesta o fue 5xx. Es seguro: la tarea es idempotente.
+          for intento in 1 2 3; do
+            code=$(curl -sS -o resp.json -w '%{http_code}' --max-time 600 -X POST "$URL" \
+              -H "X-Cron-Secret: $CRON_SECRET" -H 'Content-Type: application/json' \
+              --data "{\"modo\":\"$MODO\"}") || code=000
+            echo "Intento $intento: HTTP $code"; cat resp.json 2>/dev/null; echo
+            if [ "$code" = 200 ]; then exit 0; fi
+            case "$code" in 000|5*) sleep 60 ;; *) break ;; esac
+          done
+          echo "::error::El Worker no respondió 200 (HTTP $code)"; exit 1
+
+      # GitHub desactiva los workflows programados de un repo público tras 60 días sin actividad.
+      # Re-habilitar el workflow por la API cuenta como actividad y reinicia ese plazo; corre cada
+      # día, aunque el paso anterior falle. Usa el token propio del workflow (sin llaves extra).
+      - name: Mantener activa la tarea (anti-desactivación de 60 días)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/cron-diario.yml/enable" && echo "Workflow re-habilitado"

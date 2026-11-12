@@ -156,6 +156,7 @@ export default {
         case '/votaciones/participantes':  out = await participantesVotacion(req, env); break;
         case '/admin/probar-suspension-automatica': out = await probarSuspensionAutomatica(req, env); break;
         case '/admin/simular-recordatorio-pago': out = await simularRecordatorioPago(req, env); break;
+        case '/cron/diario':      out = await cronDiario(req, env); break;   // GitHub Actions (sin Cron Trigger de Cloudflare)
         default: out = json({ error:'Ruta no encontrada' }, 404);
       }
       return cors(out, origin);
@@ -3682,6 +3683,77 @@ async function probarSuspensionAutomatica(req, env) {
   const { modo } = await req.json();
   const resumen = await aplicarSuspensionAutomatica(env, modo === 'aplicar' ? 'aplicar' : 'simular');
   return json(resumen);
+}
+
+/* ============ /cron/diario — tarea diaria (suspensión por mora + recordatorios) ============
+   Samarkanda 2.0 no tiene Cron Trigger de Cloudflare (la cuenta está en el límite gratis), así que
+   la dispara un workflow programado de GitHub Actions en su propio repo (.github/workflows/cron-diario.yml).
+   - Auth: header X-Cron-Secret == env.CRON_SECRET (secret de Cloudflare y de GitHub, nunca en código),
+     comparado en tiempo constante (SHA-256 de ambos + XOR). Sin secret configurado (o < 32
+     caracteres) TODO se rechaza con 401: nunca queda abierto por olvido.
+   - modo:'aplicar' (el que manda el horario) hace lo mismo que scheduled(). Es seguro si corre dos
+     veces o tarde: la suspensión actúa una sola vez por mes (config/cobranza.ultimoMesProcesado, desde
+     el día 5) y cada recordatorio tiene su marca por casa y día (recordatorios_pago/{id}_{fecha}).
+     Además un candado (cron_lock/diario, caduca a los 15 min) evita dos corridas SIMULTÁNEAS.
+   - Cualquier otro modo = 'simular': solo lee, no escribe ni envía nada.
+   - La respuesta trae SOLO conteos (el log de Actions es público en un repo público): ni nombres,
+     ni casas, ni montos. */
+const CRON_LOCK = 'cron_lock/diario', CRON_LOCK_MS = 15 * 60 * 1000;
+async function secretoIgual(dado, esperado) {
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([dado, esperado].map(s => crypto.subtle.digest('SHA-256', enc.encode(s))));
+  const x = new Uint8Array(a), y = new Uint8Array(b);
+  let dif = 0;
+  for (let i = 0; i < x.length; i++) dif |= x[i] ^ y[i];
+  return dif === 0;
+}
+async function crearCandadoCron(env, at) {
+  const r = await fetch(`${fsBase(env)}:commit`, {
+    method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+    body: JSON.stringify({ writes:[{ update:{ name: docName(env, CRON_LOCK), fields:{
+      hasta:{ integerValue:String(Date.now() + CRON_LOCK_MS) } } }, currentDocument:{ exists:false } }] }),
+  });
+  if (r.ok) return true;
+  if (r.status === 409 || r.status === 400) return false;
+  throw httpErr(502, 'No se pudo tomar el candado del cron');
+}
+async function tomarCandadoCron(env, at) {
+  if (await crearCandadoCron(env, at)) return true;
+  const doc = await getDoc(env, at, CRON_LOCK);
+  const hasta = doc ? Number(readDoc(doc.fields).hasta || 0) : 0;
+  if (doc && hasta > Date.now()) return false;          // otra corrida sigue en curso
+  // Candado viejo (una corrida que murió a medias): se borra y se intenta una vez más.
+  await fetch(`${fsBase(env)}/${CRON_LOCK}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } });
+  return crearCandadoCron(env, at);
+}
+async function cronDiario(req, env) {
+  const esperado = env.CRON_SECRET || '';
+  const dado = req.headers.get('X-Cron-Secret') || '';
+  if (req.method !== 'POST' || esperado.length < 32 || !(await secretoIgual(dado, esperado))) throw httpErr(401, 'No autorizado');
+  const { modo } = await req.json().catch(() => ({}));
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+
+  if (modo !== 'aplicar') {
+    const s = await aplicarSuspensionAutomatica(env, 'simular');
+    const plan = await planRecordatoriosPago(env, at, ahoraHermosillo());
+    return json({ ok:true, modo:'simular', mes: s.mesActual, mesYaProcesado: s.ultimoMesProcesado === s.mesActual,
+      seSuspenderian: s.suspendidas.length, hoyTocaRecordatorio: !!plan.texto,
+      recordatoriosPorEnviar: plan.casas.filter(c => c.push).length });
+  }
+
+  if (!(await tomarCandadoCron(env, at))) return json({ ok:true, modo:'aplicar', enCurso:true });
+  try {
+    let susp = null, fallo = false;
+    try { susp = await aplicarSuspensionAutomatica(env, 'aplicar'); }
+    catch (e) { fallo = true; console.error('cronDiario suspension', e && e.name); }
+    const rec = await enviarRecordatoriosPago(env);   // nunca lanza
+    if (fallo) throw httpErr(500, 'Falló la suspensión automática (los recordatorios sí se procesaron)');
+    return json({ ok:true, modo:'aplicar', mes: susp.mesActual, suspensionAplicada: susp.aplico,
+      suspendidas: susp.suspendidas.length, recordatoriosEnviados: rec.enviados.length,
+      recordatoriosOmitidos: rec.omitidas.length });
+  } finally {
+    await fetch(`${fsBase(env)}/${CRON_LOCK}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
+  }
 }
 
 /* ============ /config/cobranza — cualquier usuario autenticado lee la cuota vigente ============ */

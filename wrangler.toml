@@ -30,10 +30,10 @@ class_name = "ShellyGate"
 tag = "v1"
 new_sqlite_classes = ["ShellyGate"]
 
-# PENDIENTE-SAMARKANDA: la cuenta de Cloudflare llegó al límite gratis de 5 cron triggers.
-# Sin cron, la suspensión automática por mora y los recordatorios de pago NO corren solos (el master
-# puede correrlos a mano en Finanzas). Para activarlo: plan Workers Paid o liberar un cron, y poner
-# crons = ["0 16 * * *"]. crons = [] deja explícito que este Worker no tiene cron.
+# Sin Cron Trigger de Cloudflare (la cuenta está en el límite gratis de 5). La tarea diaria
+# (suspensión por mora + recordatorios) la dispara GitHub Actions a las 16:00 UTC (9:00 Hermosillo):
+# .github/workflows/cron-diario.yml -> POST /cron/diario con el secret CRON_SECRET.
+# NO agregues aquí un cron sin quitar el de GitHub (sería idempotente, pero es doble trabajo).
 [triggers]
 crons = []
 

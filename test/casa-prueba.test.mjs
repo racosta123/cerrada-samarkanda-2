@@ -251,7 +251,7 @@ await t('abre puertas desde la app y con Siri, y recibe el aviso de Siri', async
   const v = await voz(k);
   assert.equal(v.status, 200, v.texto);
   assert.deepEqual(pulsos, ['dev-residentes', 'dev-residentes']);
-  assert.ok(fcm.some(f => f.token === 'tok9' && /abierta por voz/.test(f.title)), 'aviso push de Siri');
+  assert.ok(fcm.some(f => f.token === 'tok9' && /abierto por voz/.test(f.title)), 'aviso push de Siri');
 });
 await t('sigue sujeta a suspensión MANUAL (no abre) y a revocación de su llave', async () => {
   await marcar();
